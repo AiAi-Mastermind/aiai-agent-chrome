@@ -220,8 +220,8 @@ class Chrome:
         if not 1 <= self.port <= 65535:
             raise Failure("Configured port must be between 1 and 65535", 2)
         self.data = path(entry["data_dir"])
-        # Chrome Beta lives in /Applications on the MacBook and in ~/Applications for standard
-        # accounts on Mini 1 (Homebrew there belongs to phillip-admin). First existing wins.
+        # Chrome Beta lives in /Applications, or in ~/Applications for standard
+        # accounts that cannot write /Applications. First existing wins.
         candidates = [os.environ["AGENT_CHROME_BINARY"]] if os.environ.get("AGENT_CHROME_BINARY") else (
             config.get("binaries") or [config["binary"]])
         existing = [path(c) for c in candidates if os.path.isfile(path(c))]
@@ -894,7 +894,7 @@ def guard(args):
                     "network-state-set": "changes network behaviour for every agent sharing the browser",
                     "show": "launches a separate dashboard browser",
                     "video-start": "records every tab in the shared browser",
-                    "upload": "sends local files to a website; ask Phillip first",
+                    "upload": "sends local files to a website; ask the owner first",
                     "resize": "resizes the shared window"})
     if not args:
         raise Failure("pw requires playwright-cli arguments", 2)
