@@ -27,7 +27,7 @@ Give your AI agents (Claude Code and Codex) one safe browser of their own. You s
 ## Use it
 
 - **Claude Code:** type `/agent-chrome`, or just ask in plain words: "Use Agent Chrome to check my last three orders on Amazon."
-- **Codex:** start it with `codex -p browser`, then ask the same way.
+- **Codex:** start it with `codex -p browser`, then type `$agent-chrome` or ask the same way.
 - **When an agent hits a sign-in, code or captcha screen,** it stops and tells you which site needs you. Sign in inside the Chrome Beta window, then tell the agent to continue.
 
 ## Safety rules built in
