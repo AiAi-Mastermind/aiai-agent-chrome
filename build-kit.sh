@@ -7,7 +7,7 @@ SRC="${PG_SKILLS:-$HOME/Coding/pg-skills}/skills/agent-chrome"
 cd "$KIT"
 [ -z "$(git -C "$SRC" status --porcelain -- .)" ] || { echo "pg-skills agent-chrome has uncommitted changes; commit first" >&2; exit 1; }
 cp "$SRC/bin/agent-chrome" "$SRC/bin/jev-drive" skill/bin/
-cp "$SRC/config/jev-public-hosts.json" skill/config/
+cp "$SRC/config/jev-public-hosts.json" "$SRC/config/models.json" skill/config/
 # Client edition: no owner names or machine details in messages or comments.
 sed -i '' -e 's/ask Phillip first/ask the owner first/' \
   -e 's|# Chrome Beta lives in /Applications on the MacBook and in ~/Applications for standard|# Chrome Beta lives in /Applications, or in ~/Applications for standard|' \
@@ -20,5 +20,5 @@ printf 'version %s\nsource pg-skills %s\nlauncher sha256 %s\njev-drive sha256 %s
   "$(shasum -a 256 skill/bin/agent-chrome | cut -c1-64)" "$(shasum -a 256 skill/bin/jev-drive | cut -c1-64)" > VERSION
 mkdir -p dist
 rm -f "dist/agent-chrome-kit-$VERSION.zip"
-zip -qr "dist/agent-chrome-kit-$VERSION.zip" README.md VERSION install.sh uninstall.sh skill docs -x '*/__pycache__/*' '*.DS_Store'
+zip -qr "dist/agent-chrome-kit-$VERSION.zip" README.md AGENTS.md CLAUDE.md VERSION install.sh uninstall.sh test-kit.sh skill docs -x '*/__pycache__/*' '*.DS_Store'
 echo "built dist/agent-chrome-kit-$VERSION.zip"

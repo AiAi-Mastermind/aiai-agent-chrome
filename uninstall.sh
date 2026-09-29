@@ -16,6 +16,9 @@ for d in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
   [ -L "$d/agent-chrome" ] && rm "$d/agent-chrome"
 done
 rm -rf "$DEST"
+if grep -q "^# Agent Chrome kit: Codex profile" "$HOME/.codex/browser.config.toml" 2>/dev/null; then
+  rm "$HOME/.codex/browser.config.toml"
+fi
 echo "Removed the skill and the login item. Chrome Beta itself is still installed (brew uninstall --cask google-chrome@beta)."
 
 if [ "$PURGE" = 1 ]; then

@@ -1,0 +1,5 @@
+{
+  "_note": "The owner's model choice. browser_agent: who drives agent-chrome for signed-in work (codex-gpt-6-sol: exact 3/3, about half the cost; claude-sonnet-5-5: exact 3/3, about twice as fast). jev_takeover_model: who takes the steps Jev is under 0.93 confident about in jev-drive (gpt-6-sol: 24/24 in testing; claude-sonnet-5-5: 21/24, twice the cost). Benchmarks 2026-09-27/28.",
+  "browser_agent": "codex-gpt-6-sol",
+  "jev_takeover_model": "gpt-6-sol"
+}

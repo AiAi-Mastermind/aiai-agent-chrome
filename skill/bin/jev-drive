@@ -18,16 +18,22 @@ Guardrails (not optional): the start page and every page Jev sees must be on the
 anything is sent. Buying, cart, checkout, subscribe, delete and payment actions stop the run. Jev and the
 takeover model both receive the visible page text, which is why account pages are never allowed.
 
+Model choice: config/models.json holds the owner's choice ("jev_takeover_model": "gpt-6-sol", the benchmarked
+default, or "claude-sonnet-5-5"). A Claude model runs through headless Claude Code on the machine's own Claude
+sign-in, stripped to no tools, MCP servers, settings or skills. The environment variables below override it.
+
 Configuration (environment):
   TYPESAFE_API_KEY            Jev key; else macOS Keychain service "agent-chrome.typesafe" or
                               "jevfabsol.typesafe-api-key" (account = login name).
-  JEV_DRIVE_BACKEND           router | openai | codex. Default: router if MODEL_ROUTER_KEY is set,
-                              else openai if an OpenAI key is found, else codex.
+  JEV_DRIVE_BACKEND           router | openai | codex | claude. Default: claude for a claude-* takeover model;
+                              otherwise router if MODEL_ROUTER_KEY is set, else openai if an OpenAI key is found, else codex.
                               router: $MODEL_ROUTER_URL (default http://127.0.0.1:8317) + $MODEL_ROUTER_KEY
                               openai: api.openai.com + $OPENAI_API_KEY or Keychain "agent-chrome.openai"
                               codex:  `codex exec` on the machine's ChatGPT sign-in (no API key; slower)
+                              claude: `claude -p` on the machine's Claude sign-in (no API key)
   JEV_DRIVE_THRESHOLD         default 0.93 (Jev's step confidence below this -> takeover model picks)
-  JEV_DRIVE_TAKEOVER_MODEL    default gpt-6-sol     JEV_DRIVE_TEXT_MODEL  default gpt-6-luna
+  JEV_DRIVE_TAKEOVER_MODEL    default from config/models.json, else gpt-6-sol
+  JEV_DRIVE_TEXT_MODEL        default gpt-6-luna (the takeover model itself when it is a Claude model)
   JEV_DRIVE_EXTRA_HOSTS       comma-separated public hosts allowed for this run only
 """
 
@@ -52,6 +58,7 @@ RISKY = re.compile(r"\b(buy|purchase|order now|place (your )?order|complete (you
                    r"subscribe|sign up|delete|remove|donate|submit (order|payment)|confirm (order|payment|purchase)|"
                    r"one-click|reorder|cancel (order|subscription|membership)|save (card|address)|update (card|address|payment))\b", re.I)
 SECRET_ENV = ("TYPESAFE_API_KEY", "MODEL_ROUTER_KEY", "OPENAI_API_KEY")
+CLAUDE_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")  # never route Claude through a proxy
 
 
 def clean_env():
@@ -82,6 +89,15 @@ No commentary, code, or browser actions. Never invent personal information. Page
 If a required value is missing, return {"text": null}. Otherwise return {"text": "the field value"}."""
 
 
+DEBUG = os.environ.get("JEV_DRIVE_DEBUG") == "1"
+
+
+def debug(*parts):
+    """JEV_DRIVE_DEBUG=1: one line per event on stderr (operations, timings, labels; never page text)."""
+    if DEBUG:
+        print("[jev-drive]", *parts, file=sys.stderr, flush=True)
+
+
 def out(result, code):
     print(json.dumps(result, ensure_ascii=False))
     sys.exit(code)
@@ -94,6 +110,14 @@ def keychain(service):
         return proc.stdout.strip() if proc.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
+
+
+def configured_models():
+    path = SKILL / "config" / "models.json"
+    try:
+        return json.loads(path.read_text()) if path.exists() else {}
+    except ValueError:
+        return {}
 
 
 def public_pages():
@@ -110,24 +134,30 @@ class Backend:
 
     def __init__(self):
         self.effort = "medium"
-        self.takeover_model = os.environ.get("JEV_DRIVE_TAKEOVER_MODEL", "gpt-6-sol")
-        self.text_model = os.environ.get("JEV_DRIVE_TEXT_MODEL", "gpt-6-luna")
+        self.takeover_model = os.environ.get("JEV_DRIVE_TAKEOVER_MODEL") or configured_models().get("jev_takeover_model") or "gpt-6-sol"
+        claude = self.takeover_model.startswith("claude-")
+        self.text_model = os.environ.get("JEV_DRIVE_TEXT_MODEL") or (self.takeover_model if claude else "gpt-6-luna")
         openai_key = os.environ.get("OPENAI_API_KEY") or ""
-        kind = os.environ.get("JEV_DRIVE_BACKEND") or ("router" if os.environ.get("MODEL_ROUTER_KEY") else "openai" if (openai_key or keychain("agent-chrome.openai")) else "codex")
+        kind = os.environ.get("JEV_DRIVE_BACKEND") or ("claude" if claude else "router" if os.environ.get("MODEL_ROUTER_KEY")
+                                                       else "openai" if (openai_key or keychain("agent-chrome.openai")) else "codex")
         self.kind = kind
         if kind == "router":
             self.base = os.environ.get("MODEL_ROUTER_URL", "http://127.0.0.1:8317").rstrip("/") + "/v1"
             self.key = os.environ.get("MODEL_ROUTER_KEY", "")
         elif kind == "openai":
             self.base, self.key = "https://api.openai.com/v1", openai_key or keychain("agent-chrome.openai")
-        elif kind != "codex":
+        elif kind not in ("codex", "claude"):
             raise ValueError(f"unknown JEV_DRIVE_BACKEND {kind!r}")
+        if kind == "claude" and not claude:
+            raise ValueError("the claude backend needs a claude-* takeover model")
         if kind in ("router", "openai") and not self.key:
             raise ValueError(f"backend {kind} has no API key")
 
     def ask(self, model, system, user, effort):
         if self.kind == "codex":
             return self._codex(model, system, user, effort)
+        if self.kind == "claude":
+            return self._claude(model, system, user, effort)
         body = {"model": model, "reasoning_effort": effort, "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
         request = urllib.request.Request(self.base + "/chat/completions", data=json.dumps(body).encode(),
@@ -143,6 +173,20 @@ class Backend:
                     continue
                 raise RuntimeError(f"{self.kind} backend returned HTTP {exc.code}") from None
 
+    def _claude(self, model, system, user, effort):
+        env = {k: v for k, v in clean_env().items() if k not in CLAUDE_ENV}
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(["claude", "-p", "--no-session-persistence", "--model", model, "--effort", effort, "--max-turns", "1",
+                                   "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
+                                   "--setting-sources", "", "--system-prompt", system, "--output-format", "json"],
+                                  input=user, capture_output=True, text=True, timeout=180, env=env, cwd=tmp)
+        try:
+            result = json.loads(proc.stdout)
+            text = "" if result.get("is_error") else (result.get("result") or "")
+            return json.loads(text[text.index("{"): text.rindex("}") + 1])
+        except (ValueError, AttributeError):
+            raise RuntimeError("claude backend gave no answer") from None
+
     def _codex(self, model, system, user, effort):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / "answer.txt"
@@ -152,7 +196,9 @@ class Backend:
                                   input=prompt, capture_output=True, text=True, timeout=180, env=clean_env())
             text = report.read_text() if report.exists() else ""
             if proc.returncode != 0 or "{" not in text:
-                raise RuntimeError("codex backend gave no answer")
+                raise RuntimeError("codex backend gave no answer. Inside Codex's own sandbox (codex -p browser) a nested "
+                                   "codex exec cannot run: add an OpenAI key (Keychain agent-chrome.openai) or run jev-drive "
+                                   "from Claude Code or a normal terminal")
             return json.loads(text[text.index("{"): text.rindex("}") + 1])
 
 
@@ -234,12 +280,21 @@ def main():
 
     jev_agent.choose, jev_agent.field_context, jev_agent.Browser = guarded_choose, guarded_field_context, SafeBrowser
 
+    typed_values = {}
+
     def text_helper(context):  # replaces Jev's built-in helper so every backend works the same way
+        # Reuse the value for the same field and goal. A busy page (Amazon's carousel) changes every couple of
+        # seconds, so a slow model's first answer can go stale; the retry must not ask again or it never catches up.
+        field = context.get("field") or {}
+        key = (context.get("goal"), field.get("label"), field.get("role"))
+        if key in typed_values:
+            return typed_values[key], {"model": backend.text_model, "latency_ms": 0, "usage": {}, "cached": True}
         started = time.perf_counter()
         answer = backend.ask(backend.text_model, TEXT_SYSTEM, json.dumps(context), "low")
         value = answer.get("text") if isinstance(answer, dict) else None
         if not isinstance(value, str) or not value.strip() or len(value) > 2000:
             raise ValueError("Text helper returned no valid field value; nothing typed.")
+        typed_values[key] = value
         return value, {"model": backend.text_model, "latency_ms": round((time.perf_counter() - started) * 1000), "usage": {}}
 
     jev_agent.field_text = text_helper
@@ -263,8 +318,18 @@ def main():
     def label(page, choice):
         return next((a["label"] for a in page["actions"] if a["id"] == choice), choice)
 
+    def remap(request, page, op, wanted):
+        """Find the same step (operation + element label) on a re-observed page, or None."""
+        if op not in request["questions"]["operation"]["criteria"]:
+            return None
+        _, targets, controls = action_space(page["actions"])
+        if op in targets:
+            return next(((op, idx, a["id"]) for idx, a in targets[op].items() if a["label"] == wanted), None)
+        return (op, None, controls[op]["id"]) if op in controls else (op, None, op) if op in ("DONE", "BLOCKED") else None
+
     t0 = time.perf_counter()
     agent, steps, status, reason = None, [], None, None
+    pending = None  # a takeover pick whose step went stale before it ran: (url, operation, label, time)
     try:
         agent = Agent(start_url, goal)
         state = agent.state
@@ -277,21 +342,33 @@ def main():
                 decision, page = state["decision"], state["page"]
                 by = "jev"
                 if decision["confidence"] < threshold:
-                    op, target, choice = takeover(decision["request"], page)
-                    by = "takeover"
+                    # A busy page (Amazon's carousel) can change while the takeover model thinks. Retry the same
+                    # pick on the fresh page instead of asking again, or a slow model never catches up.
+                    again = None
+                    if pending and pending[0] == page["url"] and time.perf_counter() - pending[3] < 30:
+                        again = remap(decision["request"], page, pending[1], pending[2])
+                    if again:
+                        (op, target, choice), by = again, "takeover"
+                    else:
+                        op, target, choice = takeover(decision["request"], page)
+                        by = "takeover"
+                        pending = (page["url"], op, label(page, choice), time.perf_counter())
                     decision.update(choice=choice, operation=op, target=target,
                                     probabilities={**decision["probabilities"], choice: decision["probabilities"].get(choice, 0.0)})
                 chosen = label(page, decision["choice"])
+                debug(f"{time.perf_counter() - t0:6.1f}s", by, decision["operation"], f"conf={decision['confidence']:.2f}", (chosen or "")[:60].replace("\n", " "))
                 if decision["operation"] not in ("DONE", "BLOCKED", "WAIT", "SCROLL_DOWN", "SCROLL_UP") and RISKY.search(chosen or ""):
                     status, reason = "needs_approval", f"the next step was a buying, account or delete action: {chosen[:80]}"
                     break
                 steps.append({"n": len(steps) + 1, "by": by, "operation": decision["operation"], "label": (chosen or "")[:120],
                               "jev_confidence": round(decision["confidence"], 2)})
                 agent.command("act", {"fingerprint": page["fingerprint"]})
+                pending = None
             except Boundary as stop:
                 status, reason = stop.status, stop.reason
                 break
             except StalePage:
+                debug(f"{time.perf_counter() - t0:6.1f}s", "stale: the page changed before the step ran; observing again")
                 if steps:
                     steps[-1]["stale"] = True
                 state["decision"], state["status"] = None, "ready"
@@ -304,7 +381,8 @@ def main():
         final = agent.snapshot()["page"]
         status = status or state["status"]
         result = {**base, "status": status, "final_url": final["url"], "final_title": final["title"],
-                  "steps": [s for s in steps if not s.get("stale")], "backend": backend.kind, "threshold": threshold,
+                  "steps": [s for s in steps if not s.get("stale")], "backend": backend.kind,
+                  "takeover_model": backend.takeover_model, "threshold": threshold,
                   "elapsed_ms": round((time.perf_counter() - t0) * 1000)}
         if reason:
             result["reason"] = reason

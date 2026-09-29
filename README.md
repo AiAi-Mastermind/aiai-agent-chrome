@@ -18,7 +18,11 @@ Give your AI agents (Claude Code and Codex) one safe browser of their own. You s
 - Claude Code, Codex, or both, already signed in
 - Optional, for jev-drive: a Jev (TypeSafe) API key. An OpenAI API key is optional too and only makes jev-drive faster.
 
-## Install (about 10 minutes)
+## Let your AI agent set it up
+
+Open this folder in Claude Code or Codex and say: **"Read AGENTS.md and set this up."** The agent installs everything, asks which models you want, runs the checks in `test-kit.sh`, and stops only when it needs you (a password, a key, or signing in to your sites).
+
+## Install it yourself (about 10 minutes)
 
 1. Open Terminal in this folder.
 2. Run `./install.sh`, or `./install.sh --with-jev` to include jev-drive.
