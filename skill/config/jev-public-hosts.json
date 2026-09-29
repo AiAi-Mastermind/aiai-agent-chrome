@@ -1,0 +1,7 @@
+{
+  "_note": "Where jev-drive may run. Jev (TypeSafe) and the takeover model receive each page's visible text, so list only public pages. Each host maps to a regular expression its URL path must match; anything else (order history, account, cart, checkout, addresses, payments) stops the run before the page is sent. Amazon is limited to its home, search, browse, brand-store and product pages; they can still show the signed-in first name and delivery area. Never add banking, email, insurance-carrier, CRM, school or government sites.",
+  "hosts": {
+    "en.wikipedia.org": "^/(wiki/|w/index\\.php)",
+    "www.amazon.com": "^/$|^/s$|^/s/ref=[A-Za-z0-9_.-]+$|^/(?:(?![Yy]our)[A-Za-z0-9%-]+/)?dp/[A-Z0-9]{10}(?:/(?:ref=[A-Za-z0-9_.-]*)?)?$|^/gp/product/[A-Z0-9]{10}(?:/(?:ref=[A-Za-z0-9_.-]*)?)?$|^/gp/aw/d/[A-Z0-9]{10}(?:/(?:ref=[A-Za-z0-9_.-]*)?)?$|^/stores/(?:[A-Za-z0-9%-]+/)?page/[A-Fa-f0-9-]{36}$|^/b/?$|^/sspa/click$"
+  }
+}

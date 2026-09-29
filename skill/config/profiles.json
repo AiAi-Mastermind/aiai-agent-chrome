@@ -1,0 +1,18 @@
+{
+  "binaries": [
+    "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+    "~/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta"
+  ],
+  "native_host_source_dir": "~/Library/Application Support/Google/Chrome/NativeMessagingHosts",
+  "native_hosts": [
+    "com.openai.codexextension.json"
+  ],
+  "users": {},
+  "profiles": {
+    "personal": {
+      "port": 9230,
+      "data_dir": "~/Library/Application Support/AgentChrome/personal",
+      "label": "com.agentchromekit.agent-chrome.personal"
+    }
+  }
+}

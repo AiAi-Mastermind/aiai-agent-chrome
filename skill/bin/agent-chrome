@@ -1,0 +1,1037 @@
+#!/usr/bin/env python3
+"""Share persistent Chrome Beta: up, status, endpoint, open, down, attach, pw,
+install-launchagent, uninstall-launchagent, and doctor. Never launch via Playwright.
+"""
+
+from __future__ import annotations  # runs on macOS's built-in Python 3.9 in every account
+
+import argparse
+import contextlib
+import ctypes
+import fcntl
+import getpass
+import glob
+import json
+import os
+import plistlib
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from xml.parsers.expat import ExpatError
+
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+CHATGPT = "hehggadaopoacecdllhhajmbjkdcmajg"
+ONEPASSWORD = ("aeblfdkhhhdcdjpifhhbdiojplfjncoa", "gejiddohjgogedgjnonbofjigllpkmbf")
+INSTALL = "Install Google Chrome Beta: brew install --cask google-chrome@beta"
+PW_INSTALL = "npm install -g @playwright/cli@latest"
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ALLOWED = {"tab-new", "tab-close", "detach", "list", "snapshot", "click", "dblclick",
+           "fill", "type", "press", "hover", "select", "check", "uncheck", "drag",
+           "go-back", "go-forward", "reload", "screenshot", "pdf", "dialog-accept",
+           "dialog-dismiss", "find", "generate-locator"}
+
+
+def filter_tabs(text):
+    """Discard CLI tab inventories without printing other tabs' titles or URLs."""
+    kept = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        if line.strip() == "### Open tabs":
+            skipping = True
+            continue
+        if skipping and line.startswith("### "):
+            skipping = False
+        if not skipping:
+            kept.append(line)
+    return "".join(kept)
+
+
+def error_section(text):
+    """Return only the CLI's '### Error' section, which never lists tabs."""
+    lines, keeping = [], False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("### "):
+            keeping = line.strip() == "### Error"
+            continue
+        if keeping:
+            lines.append(line)
+    return "".join(lines)
+
+
+class Failure(Exception):
+    def __init__(self, message, code=5):
+        super().__init__(message)
+        self.code = code
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Failure(message, 2)
+
+
+def path(value):
+    return os.path.abspath(os.path.expanduser(value))
+
+
+def run(argv, timeout=10, check=True, **kwargs):
+    try:
+        result = subprocess.run(argv, timeout=timeout, text=True, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise Failure(f"{os.path.basename(argv[0])} timed out") from None
+    except OSError:
+        raise Failure(f"{os.path.basename(argv[0])} could not start") from None
+    if check and result.returncode:
+        # Do not echo arbitrary subprocess output, which may contain page secrets.
+        raise Failure(f"{argv[0]} exited with status {result.returncode}")
+    return result
+
+
+def capture(argv, timeout=10, check=True):
+    return run(argv, timeout, check, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def proc_argv(pid) -> list[str] | None:
+    """Return executable plus real argv from Darwin; never parse environment strings."""
+    if sys.platform != "darwin" or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        sysctl = libc.sysctl
+        sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+                           ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                           ctypes.c_void_p, ctypes.c_size_t]
+        sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, pid)
+        size = ctypes.c_size_t()
+        if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        if not 5 <= size.value <= 64 * 1024 * 1024:
+            return None
+        capacity = size.value
+        buffer = (ctypes.c_ubyte * capacity)()
+        if sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+        if not 5 <= size.value <= capacity:
+            return None
+        argc = int.from_bytes(bytes(buffer[:4]), "little", signed=True)
+        if argc <= 0 or argc > size.value - 4:
+            return None
+        offset = 4
+
+        def string():
+            nonlocal offset
+            start = offset
+            while offset < size.value and buffer[offset] != 0:
+                offset += 1
+            if offset >= size.value:
+                raise ValueError("Unterminated process argument")
+            value = os.fsdecode(bytes(buffer[start:offset]))
+            offset += 1
+            return value
+
+        executable = string()
+        if not executable or not os.path.isabs(executable):
+            return None
+        while offset < size.value and buffer[offset] == 0:
+            offset += 1
+        argv = [string() for _ in range(argc)]
+        # Stop at argc; do not decode, scan, or return the following environment.
+        return [executable] + argv if argv[0] else None
+    except Exception:
+        # A vanished, inaccessible, or malformed process must fail ownership closed.
+        return None
+
+
+def safe_directory(directory):
+    """Check every component before mkdir and again before callers modify it."""
+    directory = os.path.abspath(directory)
+    current = os.path.sep
+    for component in directory.split(os.path.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        if os.path.islink(current):
+            raise Failure(f"Refusing symlink directory: {current}", 4)
+        if os.path.lexists(current) and not os.path.isdir(current):
+            raise Failure(f"Not a directory: {current}", 4)
+        os.makedirs(current, mode=0o700, exist_ok=True)
+        if os.path.islink(current) or not os.path.isdir(current):
+            raise Failure(f"Unsafe directory: {current}", 4)
+    return directory
+
+
+def writable_file(filename, flags):
+    if os.path.islink(filename):
+        raise Failure(f"Refusing symlink file: {filename}", 4)
+    if os.path.lexists(filename) and not os.path.isfile(filename):
+        raise Failure(f"Refusing non-regular file: {filename}", 4)
+    fd = os.open(filename, flags | os.O_NOFOLLOW, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise Failure(f"Refusing non-regular file: {filename}", 4)
+    return fd
+
+
+def validate_url(value):
+    try:
+        url = urllib.parse.urlsplit(value)
+        valid = value.startswith(("http://", "https://")) and bool(url.hostname)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise Failure("Only valid http:// and https:// URLs are allowed", 2)
+
+
+def read_json(filename):
+    with open(filename, encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def optional_json(filename):
+    return read_json(filename) if os.path.isfile(filename) else {}
+
+
+def request(url, method=None, timeout=1.5, json_response=True):
+    try:
+        with HTTP.open(urllib.request.Request(url, method=method), timeout=timeout) as response:
+            return json.load(response) if json_response else None
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        # Avoid including response bodies or URLs containing sensitive query strings.
+        raise Failure(f"CDP request failed ({type(exc).__name__})") from exc
+
+
+class Chrome:
+    def __init__(self, profile):
+        config = read_json(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                        "..", "config", "profiles.json"))
+        if not NAME.fullmatch(profile) or profile not in config["profiles"]:
+            raise Failure(f"Unknown or invalid profile: {profile}", 2)
+        entry = config["profiles"][profile]
+        self.profile = profile
+        self.port = int(entry["port"])
+        if not 1 <= self.port <= 65535:
+            raise Failure("Configured port must be between 1 and 65535", 2)
+        self.data = path(entry["data_dir"])
+        # Chrome Beta lives in /Applications on the MacBook and in ~/Applications for standard
+        # accounts on Mini 1 (Homebrew there belongs to phillip-admin). First existing wins.
+        candidates = [os.environ["AGENT_CHROME_BINARY"]] if os.environ.get("AGENT_CHROME_BINARY") else (
+            config.get("binaries") or [config["binary"]])
+        existing = [path(c) for c in candidates if os.path.isfile(path(c))]
+        self.binary = existing[0] if existing else path(candidates[0])
+        self.label = entry["label"]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", self.label):
+            raise Failure("Invalid LaunchAgent label", 2)
+        self.host_source = path(config["native_host_source_dir"])
+        self.hosts = config["native_hosts"]
+        if any(os.path.basename(name) != name or name in ("", ".", "..") for name in self.hosts):
+            raise Failure("Native host names must be filenames", 2)
+        self.endpoint = f"http://127.0.0.1:{self.port}"
+        self.plist = path(f"~/Library/LaunchAgents/{self.label}.plist")
+        self.log = path(f"~/Library/Logs/agent-chrome/{profile}.log")
+        self.domain = f"gui/{os.getuid()}"
+        self.service = f"{self.domain}/{self.label}"
+        self.flags = [f"--user-data-dir={self.data}", f"--remote-debugging-port={self.port}",
+                      "--no-first-run", "--no-default-browser-check"]
+        self.warnings = []
+
+    @contextlib.contextmanager
+    def locked(self):
+        parent = safe_directory(os.path.dirname(self.data))
+        fd = writable_file(os.path.join(parent, f"{self.profile}.lock"), os.O_RDWR | os.O_CREAT)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def version(self, timeout=1.5):
+        try:
+            value = request(self.endpoint + "/json/version", timeout=timeout)
+            return value if isinstance(value, dict) and value.get("Browser") else None
+        except Failure:
+            return None
+
+    def listeners(self, listing=False):
+        args = ["lsof", "-nP", f"-iTCP:{self.port}", "-sTCP:LISTEN"]
+        result = capture(args + ([] if listing else ["-t"]), timeout=5, check=False)
+        # lsof exits 1 when nothing listens. It also prints WARNING lines (for example about an
+        # unreachable Time Machine network volume) that say nothing about this port; ignore them.
+        errors = [line for line in result.stderr.splitlines()
+                  if line.strip() and "WARNING" not in line and not line.startswith((" ", "\t"))]
+        if result.returncode not in (0, 1) or (result.returncode == 1 and errors):
+            raise Failure("lsof could not inspect the debugging port")
+        if listing:
+            return result.stdout
+        try:
+            return sorted({int(line) for line in result.stdout.split()})
+        except ValueError as exc:
+            raise Failure("lsof returned an invalid listener PID") from exc
+
+    def owns_pid(self, pid):
+        process = proc_argv(pid)
+        if not process or len(process) < 2:
+            return False
+        executable, argv = process[0], process[1:]
+        # Chromium accepts -switch, --switch and a bare switch; the last duplicate wins.
+        profile_args = [arg for arg in argv[1:] if re.match(r"^-{1,2}user-data-dir(=|$)", arg)]
+        return (os.path.realpath(executable) == os.path.realpath(self.binary) and
+                profile_args == [f"--user-data-dir={self.data}"] and
+                not any(arg.startswith("--type=") for arg in argv))
+
+    def verified_pid(self, pids=None):
+        pids = self.listeners() if pids is None else pids
+        for pid in pids:
+            if not self.owns_pid(pid):
+                process = proc_argv(pid)
+                executable = os.path.basename(process[0]) if process else "unknown"
+                raise Failure(f"Refusing foreign listener PID {pid}: {executable}", 4)
+        if len(pids) > 1:
+            raise Failure(f"Multiple listeners on port {self.port}: {pids}; refusing to choose", 4)
+        return pids[0] if pids else None
+
+    def main_processes(self):
+        result = capture(["ps", "-axo", "pid="], 5)
+        found = []
+        for line in result.stdout.splitlines():
+            if line.strip():
+                pid = int(line.strip())
+                if self.owns_pid(pid):
+                    found.append(pid)
+        return found
+
+    def plist_ok(self):
+        if os.path.islink(self.plist) or not os.path.isfile(self.plist):
+            return False
+        try:
+            with open(self.plist, "rb") as stream:
+                content = plistlib.load(stream)
+            keys = {"Label", "ProgramArguments", "RunAtLoad", "KeepAlive", "ProcessType",
+                    "StandardOutPath", "StandardErrorPath"}
+            return (isinstance(content, dict) and set(content) == keys and
+                    content["Label"] == self.label and
+                    content["ProgramArguments"] == [self.binary] + self.flags and
+                    content["RunAtLoad"] is True and
+                    content["KeepAlive"] == {"SuccessfulExit": False} and
+                    content["ProcessType"] == "Interactive" and
+                    content["StandardOutPath"] == content["StandardErrorPath"] == self.log)
+        except (OSError, ValueError, TypeError, OverflowError, ExpatError, plistlib.InvalidFileException):
+            return False
+
+    def loaded_job(self):
+        result = capture(["launchctl", "print", self.service], check=False)
+        if result.returncode:
+            return "absent"
+        lines = result.stdout.splitlines()
+        program = None
+        for line in lines:
+            match = re.match(r"^\s*program = (.*)$", line)
+            if match:
+                program = match.group(1).strip()
+                break
+        arguments = None
+        for index, line in enumerate(lines):
+            if re.match(r"^\s*arguments = \{\s*$", line):
+                values = []
+                for entry in lines[index + 1:]:
+                    value = entry.strip()
+                    if value == "}":
+                        arguments = values
+                        break
+                    if value:
+                        values.append(value)
+                break
+        return "ours" if program == self.binary and arguments == [self.binary] + self.flags else "foreign"
+
+    def prepare(self):
+        safe_directory(os.path.dirname(self.data))
+        safe_directory(self.data)
+        directory = safe_directory(os.path.join(self.data, "NativeMessagingHosts"))
+        os.chmod(self.data, 0o700, follow_symlinks=False)
+        for name in self.hosts:
+            source, dest = os.path.join(self.host_source, name), os.path.join(directory, name)
+            if not os.path.isfile(source):
+                self.warnings.append(f"Native host source missing: {source}")
+                continue
+            if os.path.islink(dest):
+                target = os.readlink(dest)
+                target = os.path.realpath(os.path.join(directory, target))
+                root = os.path.realpath(self.host_source)
+                if target == root or os.path.commonpath([root, target]) != root:
+                    self.warnings.append(f"Leaving foreign native host symlink untouched: {dest}")
+                    continue
+                if os.path.exists(dest) and target == os.path.realpath(source):
+                    continue
+                os.unlink(dest)
+            elif os.path.lexists(dest):
+                self.warnings.append(f"Leaving existing native host file untouched: {dest}")
+                continue
+            if os.path.isfile(source):
+                os.symlink(source, dest)
+
+    def logdir(self):
+        safe_directory(os.path.dirname(self.log))
+        if os.path.islink(self.log) or (os.path.lexists(self.log) and not os.path.isfile(self.log)):
+            raise Failure("Refusing symlink or non-regular log file", 4)
+
+    def up(self):
+        with self.locked():
+            loaded = self.loaded_job()
+            if loaded == "foreign":
+                raise Failure("Refusing foreign loaded LaunchAgent job", 4)
+            if loaded == "ours" and not self.plist_ok():
+                raise Failure("LaunchAgent label is loaded but its plist is missing or foreign; run uninstall-launchagent after checking it", 4)
+            version = self.version()
+            if version:
+                pid = self.verified_pid()
+                if pid is None:
+                    raise Failure("CDP answered but its listener PID could not be verified", 4)
+                return self.up_result(version, pid, False)
+            if self.main_processes():
+                raise Failure("Agent Chrome is running without its debugging port; quit it (agent-chrome down) and run up again", 4)
+            # A non-CDP listener is also a conflict; never launch over it.
+            if self.listeners():
+                self.verified_pid()
+                raise Failure(f"Port {self.port} is occupied but CDP is unavailable", 4)
+            self.prepare()
+            if not os.path.isfile(self.binary):
+                raise Failure(INSTALL)
+            self.logdir()
+            # Recheck the loaded label just before choosing a launch path.
+            loaded = self.loaded_job()
+            if loaded == "foreign":
+                raise Failure("Refusing foreign loaded LaunchAgent job", 4)
+            if loaded == "ours":
+                if not self.plist_ok():
+                    raise Failure("LaunchAgent label is loaded but its plist is missing or foreign; run uninstall-launchagent after checking it", 4)
+                capture(["launchctl", "kickstart", self.service])
+            else:
+                with os.fdopen(writable_file(self.log, os.O_WRONLY | os.O_CREAT | os.O_APPEND), "ab") as log:
+                    subprocess.Popen([self.binary] + self.flags, stdin=subprocess.DEVNULL,
+                                     stdout=log, stderr=log, start_new_session=True, close_fds=True)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                version = self.version(min(1.5, max(0.01, deadline - time.monotonic())))
+                if version:
+                    pid = self.verified_pid()
+                    if pid is not None:
+                        return self.up_result(version, pid, True)
+                time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+            raise Failure(f"Timed out waiting for Chrome CDP; inspect {self.log}")
+
+    def up_result(self, version, pid, started):
+        return dict(ok=True, profile=self.profile, endpoint=self.endpoint,
+                    browser=version["Browser"], pid=pid, started=started)
+
+    def status(self):
+        version, pids = self.version(), self.listeners()
+        pid = self.verified_pid(pids)
+        running = bool(version and pid)
+        pages = 0
+        if running:
+            targets = request(self.endpoint + "/json/list")
+            if not isinstance(targets, list):
+                raise Failure("CDP returned an invalid tab list")
+            pages = sum(isinstance(item, dict) and item.get("type") == "page" for item in targets)
+        loaded = self.loaded_job()
+        result = dict(running=running, profile=self.profile, port=self.port,
+                      endpoint=self.endpoint, pid=pid, browser=version["Browser"] if running else None,
+                      data_dir=self.data, pages=pages,
+                      launchagent=dict(installed=os.path.lexists(self.plist),
+                                       loaded=loaded != "absent", ours=loaded == "ours"))
+        return result, 0 if running else 3
+
+    def down(self):
+        with self.locked():
+            pid = self.verified_pid()
+            if pid is None:
+                # Recover a profile started without CDP, as described by up's diagnostic.
+                pids = self.main_processes()
+                if len(pids) > 1:
+                    raise Failure(f"Multiple profile processes {pids}; quit them manually", 4)
+                pid = pids[0] if pids else None
+            loaded = self.loaded_job()
+            note = "KeepAlive only restarts after a crash, so a clean quit stays down." if loaded == "ours" else ""
+            if pid is None:
+                return dict(ok=True, profile=self.profile, stopped=False, message="Already stopped. " + note)
+            if not self.owns_pid(pid):
+                raise Failure(f"PID {pid} changed ownership; refusing to signal it", 4)
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() >= deadline:
+                    raise Failure(f"PID {pid} did not exit within 15 seconds; no force-kill sent")
+                time.sleep(0.25)
+            return dict(ok=True, profile=self.profile, stopped=True, pid=pid,
+                        message=f"Stopped Agent Chrome PID {pid}. {note}".strip())
+
+    def install(self):
+        with self.locked():
+            loaded = self.loaded_job()
+            if loaded == "foreign":
+                raise Failure("Refusing foreign loaded LaunchAgent job", 4)
+            if os.path.lexists(self.plist) and not self.plist_ok():
+                raise Failure("Refusing to replace a foreign or symlink LaunchAgent plist", 4)
+            pids = self.listeners()
+            if loaded == "ours" and not self.plist_ok():
+                raise Failure("LaunchAgent label is loaded but its plist is missing or foreign; run uninstall-launchagent after checking it", 4)
+            if pids:
+                self.verified_pid(pids)
+                if loaded == "absent":
+                    raise Failure("Agent Chrome is running unmanaged; run agent-chrome down first", 4)
+            if loaded == "absent" and self.main_processes():
+                raise Failure("Agent Chrome is running unmanaged; run agent-chrome down first", 4)
+            self.prepare()
+            if not os.path.isfile(self.binary):
+                raise Failure(INSTALL)
+            self.logdir()
+            directory = safe_directory(os.path.dirname(self.plist))
+            content = dict(Label=self.label, ProgramArguments=[self.binary] + self.flags,
+                           RunAtLoad=True, KeepAlive={"SuccessfulExit": False}, ProcessType="Interactive",
+                           StandardOutPath=self.log, StandardErrorPath=self.log)
+            fd, temporary = tempfile.mkstemp(prefix=f".{self.label}.", suffix=".plist", dir=directory)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    plistlib.dump(content, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if os.path.lexists(self.plist) and not self.plist_ok():
+                    raise Failure("Refusing to replace a foreign or symlink LaunchAgent plist", 4)
+                loaded = self.loaded_job()
+                if loaded == "foreign":
+                    raise Failure("Refusing foreign loaded LaunchAgent job", 4)
+                if loaded == "ours":
+                    if not self.plist_ok():
+                        raise Failure("LaunchAgent label is loaded but its plist is missing or foreign; run uninstall-launchagent after checking it", 4)
+                    capture(["launchctl", "bootout", self.service])
+                os.replace(temporary, self.plist)
+            finally:
+                if os.path.lexists(temporary):
+                    os.unlink(temporary)
+            capture(["launchctl", "bootstrap", self.domain, self.plist])
+            return dict(ok=True, label=self.label, message=self.label)
+
+    def uninstall(self):
+        with self.locked():
+            loaded = self.loaded_job()
+            if loaded == "foreign":
+                raise Failure("Refusing foreign loaded LaunchAgent job; nothing removed", 4)
+            if loaded == "ours":
+                result = capture(["launchctl", "bootout", self.service], check=False)
+                if result.returncode and self.loaded_job() != "absent":
+                    raise Failure("launchctl bootout failed; LaunchAgent is still loaded")
+            if os.path.lexists(self.plist):
+                if not self.plist_ok():
+                    raise Failure("Foreign or symlink LaunchAgent plist left untouched", 4)
+                os.unlink(self.plist)
+        return dict(ok=True, label=self.label, message="Removed LaunchAgent; profile preserved")
+
+    def session_directory(self, session, check_tree=True):
+        if not NAME.fullmatch(session):
+            raise Failure("Session must match ^[a-z0-9][a-z0-9-]{0,40}$", 2)
+        root = safe_directory(path(f"~/Library/Caches/agent-chrome/{self.profile}"))
+        directory = safe_directory(os.path.join(root, session))
+        # The CLI also writes below .playwright-cli; do not let existing links
+        # redirect snapshots or other session artifacts outside this workdir.
+        if check_tree:
+            for relative in self.worktree(directory):
+                if os.path.islink(os.path.join(directory, relative)):
+                    raise Failure("Refusing symlink in session workdir", 4)
+        return directory
+
+    @contextlib.contextmanager
+    def session_locked(self, session):
+        # Do not scan artifacts while an earlier attachment may be deleting them.
+        directory = self.session_directory(session, check_tree=False)
+        fd = writable_file(os.path.join(directory, ".lock"), os.O_RDWR | os.O_CREAT)
+        with os.fdopen(fd, "a") as lock:
+            os.fchmod(lock.fileno(), 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                # Recheck artifacts after waiting for another invocation to finish.
+                yield self.session_directory(session)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def page_ids(self):
+        targets = request(self.endpoint + "/json/list")
+        if not isinstance(targets, list):
+            raise Failure("CDP returned an invalid tab list")
+        ids = set()
+        for item in targets:
+            if isinstance(item, dict) and item.get("type") == "page":
+                target = item.get("id")
+                if not isinstance(target, str) or not target:
+                    raise Failure("CDP returned an invalid page target id")
+                ids.add(target)
+        return ids
+
+    def require_tab(self, directory):
+        target = None
+        try:
+            fd = os.open(os.path.join(directory, ".own-tab"), os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("Non-regular own-tab marker")
+                marker = json.load(stream)
+            if isinstance(marker, dict) and isinstance(marker.get("target"), str):
+                target = marker["target"]
+        except (OSError, ValueError):
+            pass
+        if not target or target not in self.page_ids():
+            self.clear_marker(directory)
+            raise Failure("your tab is gone or was never opened; run tab-new <url>", 4)
+
+    @staticmethod
+    def worktree(directory):
+        entries = set()
+
+        def failed(exc):
+            raise exc
+
+        for root, directories, files in os.walk(directory, followlinks=False, onerror=failed):
+            for name in directories + files:
+                entries.add(os.path.relpath(os.path.join(root, name), directory))
+        return entries
+
+    @staticmethod
+    def clear_marker(directory):
+        marker = os.path.join(directory, ".own-tab")
+        if os.path.lexists(marker):
+            os.unlink(marker)
+
+    def attach(self, session):
+        with self.session_locked(session) as directory:
+            return self.attach_locked(session, directory)
+
+    def attach_locked(self, session, directory):
+        self.clear_marker(directory)
+        before = self.worktree(directory)
+        target_id = None
+        try:
+            binary = shutil.which("playwright-cli")
+            if not binary:
+                raise Failure(PW_INSTALL)
+            self.up()
+            target = request(self.endpoint + "/json/new?about:blank", "PUT")
+            if not isinstance(target, dict) or not isinstance(target.get("id"), str) or not target["id"]:
+                raise Failure("CDP did not return a new target id")
+            target_id = urllib.parse.quote(target["id"], safe="")
+            request(self.endpoint + "/json/activate/" + target_id, json_response=False)
+            result = run([binary, f"-s={session}", "attach", f"--cdp={self.endpoint}"],
+                         timeout=300, check=False, cwd=directory,
+                         env=dict(os.environ, NO_UPDATE_NOTIFIER="1"),
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            code = result.returncode if result.returncode >= 0 else 128 - result.returncode
+        finally:
+            try:
+                # Remove newly created files AND directories, deepest first, including
+                # hidden CLI snapshots. Never traverse symlinks during this cleanup.
+                after = self.worktree(directory)
+                for relative in sorted(after - before, key=lambda item: item.count(os.sep), reverse=True):
+                    if relative in (".lock", ".own-tab"):
+                        continue
+                    filename = os.path.join(directory, relative)
+                    if os.path.islink(filename) or not os.path.isdir(filename):
+                        os.unlink(filename)
+                    else:
+                        os.rmdir(filename)
+            finally:
+                try:
+                    if target_id is not None:
+                        request(self.endpoint + "/json/close/" + target_id, json_response=False)
+                finally:
+                    self.clear_marker(directory)
+        if code:
+            return dict(ok=False, error="attach failed", exit_code=code), code
+        return dict(ok=True, session=session, endpoint=self.endpoint), 0
+
+    def playwright(self, session, args, json_mode):
+        with self.session_locked(session) as directory:
+            if args and args[0] == "tab-new":
+                # Serialize target-list differencing across sessions in this profile.
+                with self.locked():
+                    return self.playwright_locked(session, args, json_mode, directory)
+            return self.playwright_locked(session, args, json_mode, directory)
+
+    def playwright_locked(self, session, args, json_mode, directory):
+        try:
+            guard(args)
+            marker = os.path.join(directory, ".own-tab")
+            if args[0] not in ("tab-new", "detach", "list"):
+                self.require_tab(directory)
+            binary = shutil.which("playwright-cli")
+            if not binary:
+                raise Failure(PW_INSTALL)
+            env = dict(os.environ, NO_UPDATE_NOTIFIER="1")
+            if args[0] == "tab-new":
+                self.clear_marker(directory)
+                before = self.page_ids()
+            # Always capture: CLI tab inventories must never reach either output stream.
+            result = run([binary, f"-s={session}"] + args, timeout=300, check=False,
+                         cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            code = result.returncode if result.returncode >= 0 else 128 - result.returncode
+            if args[0] == "tab-new" and code == 0:
+                new = self.page_ids() - before
+                if len(new) != 1:
+                    self.clear_marker(directory)
+                    raise Failure("could not identify your new tab; run tab-new again", 4)
+                fd = writable_file(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    os.fchmod(stream.fileno(), 0o600)
+                    json.dump({"target": next(iter(new))}, stream)
+            if args[0] in ("tab-new", "tab-close", "detach"):
+                # These responses list every tab's title and URL (including the tab selected
+                # after a close), so print only a summary built from what this session owns.
+                summary = {"tab-new": f"opened your tab: {args[-1]}", "tab-close": "closed your tab",
+                           "detach": "detached"}[args[0]]
+                stdout = summary + "\n" if code == 0 else f"{args[0]} failed (exit {code})\n"
+                stderr = error_section(result.stdout) + error_section(result.stderr)
+                if args[0] == "detach" and code == 0:
+                    self.wipe_session(directory)
+            else:
+                stdout, stderr = filter_tabs(result.stdout), filter_tabs(result.stderr)
+            if not json_mode:
+                print(stdout, end="")
+                print(stderr, end="", file=sys.stderr)
+            return dict(ok=code == 0, session=session, exit_code=code,
+                        **(dict(stdout=stdout, stderr=stderr) if json_mode else {})), code
+        finally:
+            if args and args[0] in ("tab-close", "detach"):
+                # Even a refused or failed close/detach invalidates the ownership marker.
+                self.clear_marker(directory)
+
+    def wipe_session(self, directory):
+        """Delete snapshots, screenshots, console logs and downloads kept for this session:
+        they are private account data. Keep only the lock file."""
+        for relative in sorted(self.worktree(directory), key=lambda item: item.count(os.sep), reverse=True):
+            if relative == ".lock":
+                continue
+            filename = os.path.join(directory, relative)
+            if os.path.islink(filename) or not os.path.isdir(filename):
+                os.unlink(filename)
+            else:
+                os.rmdir(filename)
+
+    def doctor(self):
+        checks = []
+
+        def add(name, status, detail):
+            checks.append(dict(check=name, status=status, detail=detail))
+
+        def inspect(name, function):
+            try:
+                function()
+            except (Failure, OSError, ValueError, KeyError, TypeError, AttributeError):
+                # Never include file contents or JSON decoder snippets in diagnostics.
+                add(name, "fail", "Could not inspect this check; verify file format, permissions, and system tools")
+
+        add("binary", "ok" if os.path.isfile(self.binary) else "fail",
+            self.binary if os.path.isfile(self.binary) else INSTALL)
+
+        def instance():
+            pids, version = self.listeners(), self.version()
+            try:
+                pid = self.verified_pid(pids)
+            except Failure as exc:
+                add("instance", "fail", str(exc))
+                return
+            add("instance", "ok" if pid and version else "warn",
+                f"Owned CDP listener PID {pid}" if pid and version else "Not running with working CDP")
+
+        def loopback():
+            lines = self.listeners(listing=True).splitlines()
+            addresses = []
+            for line in lines:
+                if "(LISTEN)" not in line:
+                    continue  # header and any warning text
+                fields = line.split()
+                if len(fields) < 9:
+                    raise ValueError("Invalid lsof listing")
+                addresses.append(fields[8].rsplit(":", 1)[0])
+            bad = [address for address in addresses if address not in ("127.0.0.1", "[::1]", "localhost")]
+            add("loopback", "fail" if bad else ("ok" if addresses else "warn"),
+                "Non-loopback listeners: " + ", ".join(bad) if bad else
+                ("All listeners are loopback-only" if addresses else "No listener to inspect"))
+
+        def processes():
+            pids = self.main_processes()
+            add("main processes", "fail" if len(pids) > 1 else ("ok" if pids else "warn"),
+                f"{len(pids)} main process(es): {pids}")
+
+        inspect("instance", instance)
+        inspect("loopback", loopback)
+        inspect("main processes", processes)
+        for name in self.hosts:
+            dest = os.path.join(self.data, "NativeMessagingHosts", name)
+            good = (os.path.islink(dest) and os.path.isfile(dest) and
+                    os.path.realpath(dest) == os.path.realpath(os.path.join(self.host_source, name)))
+            add("native host " + name, "ok" if good else "warn",
+                "Symlink resolves to source" if good else "Missing, broken, or incorrect native-host symlink")
+        extensions = os.path.join(self.data, "Default", "Extensions")
+        present = os.path.isdir(os.path.join(extensions, CHATGPT))
+        add("ChatGPT extension", "ok" if present else "warn", "Installed" if present else
+            "install it from the Chrome Web Store inside Agent Chrome so the Codex chrome plugin lands here")
+        vaults = [item for item in ONEPASSWORD if os.path.isdir(os.path.join(extensions, item))]
+        add("1Password extension", "warn" if vaults else "ok",
+            "Remove 1Password: agents must not reach vault autofill" if vaults else "Absent")
+
+        def outside():
+            chrome = path("~/Library/Application Support/Google/Chrome")
+            arc = path("~/Library/Application Support/Arc/User Data")
+            cache = optional_json(os.path.join(chrome, "Local State")).get("profile", {}).get("info_cache", {})
+            found = []
+            for brand, root in (("Chrome", chrome), ("Arc", arc)):
+                for extension in sorted(glob.glob(os.path.join(root, "*", "Extensions", CHATGPT))):
+                    if not os.path.isdir(extension):
+                        continue
+                    directory = os.path.basename(os.path.dirname(os.path.dirname(extension)))
+                    display = cache.get(directory, {}).get("name", directory) if brand == "Chrome" else directory
+                    found.append(f"{brand}: {display} ({directory})")
+            add("ChatGPT outside Agent Chrome", "warn" if found else "ok",
+                "; ".join(found) + "; remove the ChatGPT extension from these so Codex cannot attach to them"
+                if found else "No installations found in personal Chrome or Arc")
+
+        def auto_attach():
+            enabled = optional_json(path("~/.claude.json")).get("claudeInChromeDefaultEnabled") is True
+            add("Claude auto-attach", "warn" if enabled else "ok",
+                "claudeInChromeDefaultEnabled is true; disable personal Chrome auto-attach for agent work"
+                if enabled else "Personal Chrome auto-attach not enabled")
+
+        def sync():
+            prefs = optional_json(os.path.join(self.data, "Default", "Preferences"))
+            accounts = prefs.get("account_info", [])
+            enabled = ((isinstance(accounts, list) and bool(accounts)) or
+                       prefs.get("google", {}).get("services", {}).get("consented_to_sync") is True or
+                       prefs.get("google.services.consented_to_sync") is True)
+            add("Chrome sync", "warn" if enabled else "ok",
+                "do not turn on Chrome sync here; it would pull in personal extensions and passwords"
+                if enabled else "No account or sync consent recorded")
+
+        def isolation():
+            # Other human accounts on this Mac can reach any loopback port unless the pf anchor
+            # written by agent-chrome-isolate names this port. (Loaded state needs root to read.)
+            import pwd
+            humans = [u.pw_name for u in pwd.getpwall() if u.pw_uid >= 501 and not u.pw_name.startswith("_")
+                      and os.path.isdir(u.pw_dir) and u.pw_dir.startswith("/Users/")]
+            if len(humans) <= 1:
+                return add("port isolation", "ok", "single-account Mac")
+            covered = os.path.isfile(ISOLATION_ANCHOR) and f"port {self.port} " in open(ISOLATION_ANCHOR).read()
+            add("port isolation", "ok" if covered else "warn",
+                f"pf rule restricts port {self.port} to its owner" if covered else
+                f"{len(humans)} accounts on this Mac can reach port {self.port}; an admin must run "
+                "`sudo agent-chrome-isolate install` before anyone signs in here")
+
+        def hermes_shim():
+            # Hermes profiles that point browser.cdp_url at Agent Chrome need agent-browser-shim
+            # in front of agent-browser, or every task leaves a tab behind (see SKILL.md 7b).
+            candidates = set(glob.glob(path("~/.local/share/hermes-profile*/**/config.yaml"), recursive=True))
+            candidates |= set(glob.glob(path("~/.hermes/**/config.yaml"), recursive=True))
+            profiles = [f for f in sorted(candidates) if "/backups/" not in f
+                        and "cdp_url" in open(f, encoding="utf-8", errors="replace").read()]
+            if not profiles:
+                return add("hermes shim", "ok", "no Hermes profile uses Agent Chrome")
+            link = os.path.realpath(path("~/.local/bin/agent-browser"))
+            good = os.path.basename(link) == "agent-browser-shim"
+            add("hermes shim", "ok" if good else "warn",
+                f"{len(profiles)} Hermes profile(s) use Agent Chrome through the shim" if good else
+                "~/.local/bin/agent-browser is not agent-browser-shim; Hermes tasks will leave tabs behind")
+            texts = {f: open(f, encoding="utf-8", errors="replace").read() for f in profiles}
+            no_off = [f for f, t in texts.items() if not re.search(r"(?m)^\s+backend:\s*('off'|\"off\"|off|false)\s*$", t)]
+            cdp_on = [f for f, t in texts.items() if "browser-cdp" not in t]
+            short = lambda fs: ", ".join(os.path.basename(os.path.dirname(f)) for f in fs)
+            add("hermes browser backend", "warn" if no_off else "ok",
+                f"browser.backend is not off in: {short(no_off)} (Hermes may hide its browser tools)" if no_off else
+                "built-in browser tools (backend: off) in every profile")
+            add("hermes browser_cdp", "fail" if cdp_on else "ok",
+                f"raw browser_cdp tool enabled in: {short(cdp_on)}; add browser-cdp to disabled_toolsets" if cdp_on else
+                "raw browser_cdp tool disabled in every profile")
+
+        inspect("port isolation", isolation)
+        inspect("hermes shim", hermes_shim)
+        inspect("ChatGPT outside Agent Chrome", outside)
+        inspect("Claude auto-attach", auto_attach)
+        inspect("Chrome sync", sync)
+        add("playwright-cli", "ok" if shutil.which("playwright-cli") else "warn",
+            "Available" if shutil.which("playwright-cli") else PW_INSTALL)
+        failed = any(item["status"] == "fail" for item in checks)
+        return dict(ok=not failed, checks=checks), int(failed)
+
+
+def guard(args):
+    reasons = {name: "can shut down or wipe the shared signed-in browser; use detach"
+               for name in ("close", "close-all", "kill-all", "delete-data")}
+    reasons.update({"open": "would launch a separate unsigned browser; use tab-new",
+                    "state-save": "writes live session cookies to plaintext, forbidden by the machine's secrets policy",
+                    "state-load": "injects foreign cookies",
+                    "install-browser": "installs a separate browser; use the dedicated Chrome Beta instance",
+                    "goto": "use `tab-new <url>` so you never navigate a tab you did not open",
+                    "install": "installs browsers; the dedicated Chrome Beta instance is the only agent browser",
+                    "eval": "eval can read cookies and web storage; use snapshot to read the page",
+                    "console": "page console output can contain tokens",
+                    "requests": "request URLs can carry tokens",
+                    "tab-select": "could select a tab you did not open",
+                    "tab-list": "lists titles and URLs of tabs you did not open",
+                    "run-code": "runs arbitrary Playwright code with access to every cookie in the shared profile",
+                    "tracing-start": "trace files record request headers and cookies in plaintext",
+                    "route": "changes network behaviour for every agent sharing the browser",
+                    "unroute": "changes network behaviour for every agent sharing the browser",
+                    "network-state-set": "changes network behaviour for every agent sharing the browser",
+                    "show": "launches a separate dashboard browser",
+                    "video-start": "records every tab in the shared browser",
+                    "upload": "sends local files to a website; ask Phillip first",
+                    "resize": "resizes the shared window"})
+    if not args:
+        raise Failure("pw requires playwright-cli arguments", 2)
+    command = args[0]
+    if command.startswith(("cookie-", "localstorage-", "sessionstorage-")):
+        reasons[command] = "reads or alters live session storage, which is credential material"
+    if command.startswith(("request", "response")) and command not in reasons:
+        reasons[command] = "can print auth headers, cookies or submitted passwords"
+    if command not in ALLOWED:
+        if command in reasons:
+            raise Failure(f"Refusing {command}: {reasons[command]}", 4)
+        raise Failure(f"{command} is not on the agent-chrome allowlist", 4)
+    if any(arg.startswith("-") for arg in args[1:]):
+        raise Failure("options are not allowed through the wrapper; output files stay in the session folder", 4)
+    if command == "tab-close" and len(args) != 1:
+        raise Failure("tab-close takes no index here; it closes your current tab", 4)
+    if command == "tab-new":
+        if len(args) != 2:
+            raise Failure("tab-new requires exactly one http(s) URL", 2)
+        validate_url(args[1])
+    if command in {"detach", "list", "snapshot", "go-back", "go-forward", "reload",
+                   "screenshot", "pdf", "dialog-dismiss"} and len(args) != 1:
+        raise Failure(f"{command} takes no arguments", 2)
+
+
+def default_profile():
+    """Each macOS account gets its own profile and port: loopback ports are shared by every account
+    on a Mac, so two accounts must never use the same one."""
+    try:
+        config = read_json(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "config", "profiles.json"))
+        return config.get("users", {}).get(getpass.getuser(), "personal")
+    except (OSError, ValueError):
+        return "personal"
+
+
+ISOLATION_ANCHOR = "/etc/pf.anchors/com.philgood.agent-chrome"
+
+
+def parse():
+    parser = Parser(description=__doc__)
+    parser.add_argument("--profile", default=os.environ.get("AGENT_CHROME_PROFILE") or default_profile())
+    parser.add_argument("--json", action="store_true")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("up", "status", "endpoint", "open", "down", "attach", "pw",
+                 "install-launchagent", "uninstall-launchagent", "doctor"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--profile", default=argparse.SUPPRESS)
+        sub.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        if name == "open":
+            sub.add_argument("url")
+        if name in ("attach", "pw"):
+            sub.add_argument("session")
+        if name == "pw":
+            sub.add_argument("args", nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+
+def main():
+    json_mode = "--json" in sys.argv[1:]
+    chrome = None
+    command = None
+    try:
+        args = parse()
+        json_mode = args.json
+        command, code = args.command, 0
+        chrome = Chrome(args.profile)
+        if command in ("attach", "pw") and not NAME.fullmatch(args.session):
+            raise Failure("Session must match ^[a-z0-9][a-z0-9-]{0,40}$", 2)
+        if command == "up":
+            result = chrome.up()
+        elif command == "endpoint":
+            result = dict(ok=True, profile=chrome.profile, endpoint=chrome.endpoint)
+        elif command == "status":
+            result, code = chrome.status()
+        elif command == "open":
+            validate_url(args.url)
+            chrome.up()
+            target = request(chrome.endpoint + "/json/new?" + urllib.parse.quote(args.url, safe=""), "PUT")
+            if not isinstance(target, dict) or not target.get("id"):
+                raise Failure("CDP did not return a new target id")
+            result = dict(ok=True, profile=chrome.profile, id=target["id"])
+        elif command == "down":
+            result = chrome.down()
+        elif command == "attach":
+            result, code = chrome.attach(args.session)
+        elif command == "pw":
+            result, code = chrome.playwright(args.session, args.args, json_mode)
+        elif command == "install-launchagent":
+            result = chrome.install()
+        elif command == "uninstall-launchagent":
+            result = chrome.uninstall()
+        else:
+            result, code = chrome.doctor()
+        if chrome.warnings and command != "attach":
+            result["warnings"] = chrome.warnings
+        if json_mode:
+            print(json.dumps(result))
+        else:
+            for warning in result.get("warnings", []):
+                print("Warning: " + warning, file=sys.stderr)
+            if command == "doctor":
+                for item in result["checks"]:
+                    print(f"{item['status'].upper():4}  {item['check']:30}  {item['detail']}")
+            elif command == "status":
+                print(f"{'Running' if result['running'] else 'Not running'}: {chrome.endpoint}")
+                print(f"PID: {result['pid']}  Browser: {result['browser']}  Pages: {result['pages']}")
+                print(f"Profile: {chrome.data}\nLaunchAgent: {result['launchagent']}")
+            elif command in ("endpoint", "up"):
+                print(result["endpoint"] + (f"  {result['browser']} (PID {result['pid']})" if command == "up" else ""))
+            elif command == "open":
+                print(result["id"])
+            elif command == "attach":
+                if code:
+                    print(f"{code}: attach failed", file=sys.stderr)
+                else:
+                    print(f"attached {result['session']} to {result['endpoint']}")
+            elif command != "pw":
+                print(result["message"])
+        return code
+    except (Failure, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        code = exc.code if isinstance(exc, Failure) else 5
+        # JSON parse errors can embed input values; never print those values.
+        message = str(exc) if isinstance(exc, (Failure, OSError)) else "Invalid configuration, URL, or CDP response"
+        if command == "attach":
+            message = "attach failed"
+        result = dict(ok=False, error=message, exit_code=code)
+        if chrome and chrome.warnings and command != "attach":
+            result["warnings"] = chrome.warnings
+        if json_mode:
+            print(json.dumps(result))
+        else:
+            print(f"{code}: attach failed" if command == "attach" else "agent-chrome: " + message,
+                  file=sys.stderr)
+            for warning in result.get("warnings", []):
+                print("Warning: " + warning, file=sys.stderr)
+        return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
